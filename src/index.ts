@@ -15,6 +15,7 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createServer, type Env } from "./server.js";
 import { StripeService }          from "./services/stripe.js";
+import { QuickBooksService }      from "./services/quickbooks.js";
 import { handleAnalyzeJobs }      from "./tools/analyze-jobs.js";
 import { handleAuditExpenses }    from "./tools/audit-expenses.js";
 import { handleCommissionAudit }  from "./tools/commission-audit.js";
@@ -70,6 +71,22 @@ export default {
 
     if (request.method === "POST" && url.pathname === "/try-free") {
       return handleTryFreeUpload(request);
+    }
+
+    if (request.method === "GET" && url.pathname === "/qb/connect") {
+      return handleQbConnect(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/qb/callback") {
+      return handleQbCallback(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/qb/disconnect") {
+      return handleQbDisconnect(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/qb/status") {
+      return handleQbStatus(request, env);
     }
 
     if (request.method === "GET" && url.pathname === "/health") {
@@ -388,6 +405,185 @@ async function handleTryFreeUpload(request: Request): Promise<Response> {
   const result = await handler({ csv_text: csvText } as any, {} as any, {});
 
   return htmlResponse(renderTryFreeResultPage(result, type, file.name), 200);
+}
+
+// ---------------------------------------------------------------------------
+// QuickBooks Online — OAuth 2.0 flow + connection management
+// ---------------------------------------------------------------------------
+
+/**
+ * GET /qb/connect?api_key=ba_…
+ *
+ * Build an HMAC-signed OAuth state token (encoding the apiKey), redirect
+ * the user to Intuit's authorization page. Intuit will bounce back to
+ * /qb/callback with ?code, ?state, ?realmId after the user grants access.
+ */
+async function handleQbConnect(request: Request, env: Env): Promise<Response> {
+  const apiKey = new URL(request.url).searchParams.get("api_key");
+  if (!apiKey || !apiKey.startsWith("ba_")) {
+    return htmlResponse(
+      renderErrorPage(
+        "Missing API key",
+        "Connect with /qb/connect?api_key=<your-ba_key>. You'll find your key on the checkout success page or by emailing hello@buildaudit.dev.",
+      ),
+      400,
+    );
+  }
+
+  if (!env.QUICKBOOKS_CLIENT_ID || !env.QUICKBOOKS_CLIENT_SECRET || !env.QUICKBOOKS_STATE_SECRET) {
+    return htmlResponse(
+      renderErrorPage(
+        "QuickBooks not yet configured",
+        "This worker doesn't have Intuit credentials yet. Set QUICKBOOKS_CLIENT_ID, QUICKBOOKS_CLIENT_SECRET, and QUICKBOOKS_STATE_SECRET as Worker secrets, then try again.",
+      ),
+      503,
+    );
+  }
+
+  const qb    = new QuickBooksService(env);
+  const state = await qb.signState(apiKey);
+  const url   = qb.buildAuthorizeUrl(state);
+  return Response.redirect(url, 302);
+}
+
+/**
+ * GET /qb/callback?code=…&state=…&realmId=…
+ *
+ * Intuit's redirect target. Verify the state HMAC, exchange the code for
+ * tokens, and persist them in the apiKey-keyed UserState DO.
+ */
+async function handleQbCallback(request: Request, env: Env): Promise<Response> {
+  const params  = new URL(request.url).searchParams;
+  const code    = params.get("code");
+  const state   = params.get("state");
+  const realmId = params.get("realmId");
+  const error   = params.get("error");
+
+  if (error) {
+    return htmlResponse(
+      renderErrorPage(
+        "QuickBooks declined the connection",
+        `Intuit returned an error: ${error}. ${params.get("error_description") ?? ""}`.trim(),
+      ),
+      400,
+    );
+  }
+  if (!code || !state || !realmId) {
+    return htmlResponse(
+      renderErrorPage(
+        "Incomplete callback",
+        "Intuit didn't return the parameters we expected (code, state, realmId). Try /qb/connect again.",
+      ),
+      400,
+    );
+  }
+
+  const qb     = new QuickBooksService(env);
+  const apiKey = await qb.verifyState(state);
+  if (!apiKey) {
+    return htmlResponse(
+      renderErrorPage(
+        "OAuth state mismatch",
+        "We couldn't verify the state token from Intuit's callback. This usually means the connect link was tampered with or our signing secret rotated. Start over at /qb/connect.",
+      ),
+      400,
+    );
+  }
+
+  let tokens;
+  try {
+    tokens = await qb.exchangeCodeForTokens(code, realmId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    return htmlResponse(
+      renderErrorPage(
+        "Couldn't complete the QuickBooks connection",
+        "Intuit rejected the token exchange. This is usually a configuration mismatch on the redirect URI.",
+        msg,
+      ),
+      502,
+    );
+  }
+
+  // Persist on the apiKey-keyed DO
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  const r = await stub.fetch(new Request("https://user-state/set-qb-tokens", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({
+      realmId:              tokens.realmId,
+      accessToken:          tokens.accessToken,
+      refreshToken:         tokens.refreshToken,
+      accessTokenExpiresAt: tokens.accessTokenExpiresAt,
+    }),
+  }));
+  if (!r.ok) {
+    return htmlResponse(
+      renderErrorPage(
+        "Couldn't save your tokens",
+        `Tokens were issued by Intuit but our storage layer returned ${r.status}. Email hello@buildaudit.dev so we can sort this out without your tokens being stranded.`,
+      ),
+      500,
+    );
+  }
+
+  return htmlResponse(renderQbConnectedPage(realmId), 200);
+}
+
+/**
+ * GET /qb/disconnect?api_key=ba_…
+ *
+ * Revoke the refresh token at Intuit and clear stored tokens locally.
+ */
+async function handleQbDisconnect(request: Request, env: Env): Promise<Response> {
+  const apiKey = new URL(request.url).searchParams.get("api_key");
+  if (!apiKey || !apiKey.startsWith("ba_")) {
+    return htmlResponse(
+      renderErrorPage("Missing API key", "Disconnect with /qb/disconnect?api_key=<your-key>."),
+      400,
+    );
+  }
+
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  const r = await stub.fetch(new Request("https://user-state/get-qb-tokens"));
+  if (!r.ok) {
+    return htmlResponse(
+      renderErrorPage("Lookup failed", `UserState DO returned ${r.status}.`),
+      500,
+    );
+  }
+  const stored = await r.json<{ connected: boolean; refreshToken: string | null }>();
+
+  if (stored.connected && stored.refreshToken) {
+    try {
+      await new QuickBooksService(env).revoke(stored.refreshToken);
+    } catch {
+      // Continue with local clear even if revoke fails — Intuit may already
+      // have invalidated the token; clearing locally is more important.
+    }
+  }
+
+  await stub.fetch(new Request("https://user-state/clear-qb-tokens", { method: "POST" }));
+  return htmlResponse(renderQbDisconnectedPage(), 200);
+}
+
+/**
+ * GET /qb/status?api_key=ba_… — JSON connection status for the dashboard.
+ */
+async function handleQbStatus(request: Request, env: Env): Promise<Response> {
+  const apiKey = new URL(request.url).searchParams.get("api_key");
+  if (!apiKey || !apiKey.startsWith("ba_")) {
+    return jsonResponse({ error: "Missing or malformed api_key" }, 400);
+  }
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  const r = await stub.fetch(new Request("https://user-state/get-qb-tokens"));
+  if (!r.ok) return jsonResponse({ error: `UserState DO ${r.status}` }, 500);
+  const s = await r.json<{ connected: boolean; realmId: string | null; connectedAt: number | null }>();
+  return jsonResponse({
+    connected:    s.connected,
+    realm_id:     s.realmId,
+    connected_at: s.connectedAt,
+  }, 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +1149,41 @@ function renderErrorPage(title: string, message: string, detail?: string): strin
   <p class="lead">${safeMsg}</p>
   ${detailHtml}
   <a href="/upgrade" class="btn">Back to upgrade</a>
+</div></body></html>`;
+}
+
+function renderQbConnectedPage(realmId: string): string {
+  const safe = escapeHtml(realmId);
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — QuickBooks connected</title>${PAGE_HEAD}
+</head><body><div class="wrap">
+  <span class="badge">QuickBooks connected</span>
+  <h1>Your <span>QuickBooks file</span> is linked.</h1>
+  <p class="lead">From now on, your AI assistant can sync jobs and expenses directly from this company file. No more CSV exports.</p>
+
+  <h2>Company ID</h2>
+  <pre>${safe}</pre>
+
+  <h2>Try it</h2>
+  <p>Open Claude Desktop or Cursor and ask:</p>
+  <pre>"Pull my jobs from QuickBooks and tell me which ones are losing money."</pre>
+  <p>The assistant will call <code>quickbooks_sync</code> → <code>analyze_jobs</code> and surface the underwater jobs with dollar exposure.</p>
+
+  <h2>Token lifecycle</h2>
+  <p style="font-size: 0.9rem;">Access tokens auto-refresh in the background using your refresh token (good for ~100 days of inactivity). If you don't sync for over 100 days you'll be prompted to reconnect.</p>
+
+  <p style="margin-top: 2rem;"><a href="/upgrade" class="btn btn-ghost">Back to plans</a></p>
+</div></body></html>`;
+}
+
+function renderQbDisconnectedPage(): string {
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — QuickBooks disconnected</title>${PAGE_HEAD}
+</head><body><div class="wrap">
+  <span class="badge">Disconnected</span>
+  <h1>QuickBooks unlinked.</h1>
+  <p class="lead">We've revoked your refresh token at Intuit and cleared the stored credentials on our side. <code>quickbooks_sync</code> calls will fail until you reconnect.</p>
+  <a href="/upgrade" class="btn">Done</a>
 </div></body></html>`;
 }
 

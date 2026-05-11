@@ -17,12 +17,14 @@ import { auditExpensesSchema }    from "./schemas/audit-expenses.js";
 import { varianceAlertsSchema }   from "./schemas/variance-alerts.js";
 import { commissionAuditSchema }  from "./schemas/commission-audit.js";
 import { cashFlowSchema }         from "./schemas/cash-flow.js";
+import { quickbooksSyncSchema }   from "./schemas/quickbooks-sync.js";
 
 import { handleAnalyzeJobs }      from "./tools/analyze-jobs.js";
 import { handleAuditExpenses }    from "./tools/audit-expenses.js";
 import { handleVarianceAlerts }   from "./tools/variance-alerts.js";
 import { handleCommissionAudit }  from "./tools/commission-audit.js";
 import { handleCashFlow }         from "./tools/cash-flow.js";
+import { handleQuickBooksSync }   from "./tools/quickbooks-sync.js";
 
 import { authenticateRequest }    from "./middleware/auth.js";
 import { toMcpError }             from "./utils/errors.js";
@@ -39,6 +41,12 @@ export interface Env {
   STRIPE_ENTERPRISE_PRICE_ID: string;
   PUBLIC_BASE_URL: string;
   USER_STATE: DurableObjectNamespace;
+  // QuickBooks Online OAuth + API config
+  QUICKBOOKS_CLIENT_ID: string;
+  QUICKBOOKS_CLIENT_SECRET: string;
+  QUICKBOOKS_REDIRECT_URI: string;
+  QUICKBOOKS_STATE_SECRET: string;
+  QUICKBOOKS_ENVIRONMENT?: "sandbox" | "production";
 }
 
 // ---------------------------------------------------------------------------
@@ -112,6 +120,13 @@ export function createServer(env: Env, request: Request): McpServer {
     "Project cash flow over the next 90 days based on active jobs. Shows weekly inflows/outflows, identifies when cash might go negative, and calculates total projected cash position.",
     cashFlowSchema.shape,
     withMiddleware(handleCashFlow, env, request)
+  );
+
+  server.tool(
+    "quickbooks_sync",
+    "Pull live job and expense data from the caller's connected QuickBooks Online file. Returns { jobs, expenses } shaped like the other tools' inputs, so the LLM can chain this into analyze_jobs, audit_expenses, etc. without re-uploading anything. Requires the user to have authorized via /qb/connect first.",
+    quickbooksSyncSchema.shape,
+    withMiddleware(handleQuickBooksSync, env, request)
   );
 
   return server;

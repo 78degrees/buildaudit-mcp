@@ -25,6 +25,12 @@ interface UserStateData {
   stripeCustomerId: string | null;
   stripeSubscriptionId: string | null;
   invalidated: boolean;
+  // QuickBooks Online connection (OAuth 2.0)
+  qbRealmId: string | null;              // Intuit "company ID" — required on every API call
+  qbAccessToken: string | null;          // Short-lived, ~1 hour
+  qbRefreshToken: string | null;         // Long-lived, ~100 days
+  qbAccessTokenExpiresAt: number | null; // Unix ms — when access token stops working
+  qbConnectedAt: number | null;
 }
 
 export class UserState extends DurableObject<Env> {
@@ -42,6 +48,12 @@ export class UserState extends DurableObject<Env> {
         return this.handleSetKey(request);
       case "/invalidate":
         return this.handleInvalidate();
+      case "/set-qb-tokens":
+        return this.handleSetQbTokens(request);
+      case "/clear-qb-tokens":
+        return this.handleClearQbTokens();
+      case "/get-qb-tokens":
+        return this.handleGetQbTokens();
       default:
         return new Response("Not Found", { status: 404 });
     }
@@ -98,6 +110,50 @@ export class UserState extends DurableObject<Env> {
   }
 
   // -------------------------------------------------------------------------
+  // QuickBooks Online — store / refresh / read OAuth tokens
+  // -------------------------------------------------------------------------
+
+  private async handleSetQbTokens(request: Request): Promise<Response> {
+    const body = await request.json<{
+      realmId: string;
+      accessToken: string;
+      refreshToken: string;
+      accessTokenExpiresAt: number;
+    }>();
+    const d = await this.getState();
+    d.qbRealmId               = body.realmId;
+    d.qbAccessToken           = body.accessToken;
+    d.qbRefreshToken          = body.refreshToken;
+    d.qbAccessTokenExpiresAt  = body.accessTokenExpiresAt;
+    d.qbConnectedAt           = d.qbConnectedAt ?? Date.now();
+    await this.saveState(d);
+    return json({ ok: true, qbConnectedAt: d.qbConnectedAt });
+  }
+
+  private async handleClearQbTokens(): Promise<Response> {
+    const d = await this.getState();
+    d.qbRealmId              = null;
+    d.qbAccessToken          = null;
+    d.qbRefreshToken         = null;
+    d.qbAccessTokenExpiresAt = null;
+    d.qbConnectedAt          = null;
+    await this.saveState(d);
+    return json({ ok: true });
+  }
+
+  private async handleGetQbTokens(): Promise<Response> {
+    const d = await this.getState();
+    return json<QbTokensResponse>({
+      connected:              d.qbRealmId !== null && d.qbRefreshToken !== null,
+      realmId:                d.qbRealmId,
+      accessToken:            d.qbAccessToken,
+      refreshToken:           d.qbRefreshToken,
+      accessTokenExpiresAt:   d.qbAccessTokenExpiresAt,
+      connectedAt:            d.qbConnectedAt,
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Persistence
   // -------------------------------------------------------------------------
 
@@ -108,14 +164,19 @@ export class UserState extends DurableObject<Env> {
       this.data = stored;
     } else {
       this.data = {
-        userId:               null,
-        apiKey:               null,
-        apiKeyIssuedAt:       null,
-        email:                null,
-        tier:                 "free",
-        stripeCustomerId:     null,
-        stripeSubscriptionId: null,
-        invalidated:          false,
+        userId:                  null,
+        apiKey:                  null,
+        apiKeyIssuedAt:          null,
+        email:                   null,
+        tier:                    "free",
+        stripeCustomerId:        null,
+        stripeSubscriptionId:    null,
+        invalidated:             false,
+        qbRealmId:               null,
+        qbAccessToken:           null,
+        qbRefreshToken:          null,
+        qbAccessTokenExpiresAt:  null,
+        qbConnectedAt:           null,
       };
     }
     return this.data;
@@ -132,6 +193,15 @@ interface ValidateKeyResponse {
   tier: UserTier | null;
   email: string | null;
   stripeCustomerId: string | null;
+}
+
+interface QbTokensResponse {
+  connected: boolean;
+  realmId: string | null;
+  accessToken: string | null;
+  refreshToken: string | null;
+  accessTokenExpiresAt: number | null;
+  connectedAt: number | null;
 }
 
 function json<T>(data: T): Response {

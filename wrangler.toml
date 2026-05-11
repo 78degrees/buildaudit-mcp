@@ -16,6 +16,12 @@ STRIPE_AGENCY_PRICE_ID = "price_1TVizbFOBmZeyzXryl5sRgJ8"
 STRIPE_ENTERPRISE_PRICE_ID = "price_1TVizcFOBmZeyzXrs7qB0zpI"
 PUBLIC_BASE_URL = "https://api.buildaudit.dev"
 
+# QuickBooks Online OAuth + API config
+# Secrets (QUICKBOOKS_CLIENT_ID, QUICKBOOKS_CLIENT_SECRET, QUICKBOOKS_STATE_SECRET)
+# are uploaded via `wrangler secret put`, not declared here.
+QUICKBOOKS_REDIRECT_URI = "https://api.buildaudit.dev/qb/callback"
+QUICKBOOKS_ENVIRONMENT = "production"
+
 # Durable Object for per-user auth + tier state
 [durable_objects]
 bindings = [
