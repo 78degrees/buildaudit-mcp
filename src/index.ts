@@ -415,7 +415,7 @@ function renderSuccessPage(apiKey: string, paid: boolean): string {
   "mcpServers": {
     "buildaudit": {
       "transport": "http",
-      "url": "${escapeHtml("https://buildaudit-mcp.example.workers.dev/mcp")}",
+      "url": "${escapeHtml("https://api.buildaudit.dev/mcp")}",
       "headers": { "Authorization": "Bearer ${safeKey}" }
     }
   }

@@ -2,11 +2,17 @@ name = "buildaudit-mcp"
 main = "src/index.ts"
 compatibility_date = "2026-05-01"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Custom domain — routes API traffic through buildaudit.dev zone
+routes = [
+  { pattern = "api.buildaudit.dev", custom_domain = true }
+]
 
 [vars]
-ENVIRONMENT = "development"
-STRIPE_PRO_PRICE_ID = "price_TBD"
-PUBLIC_BASE_URL = "http://localhost:8787"
+ENVIRONMENT = "production"
+STRIPE_PRO_PRICE_ID = "price_1TVizbFOBmZeyzXrtGUzkguF"
+PUBLIC_BASE_URL = "https://api.buildaudit.dev"
 
 # Durable Object for per-user auth + tier state
 [durable_objects]
