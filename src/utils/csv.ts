@@ -128,8 +128,9 @@ const JOB_ALIASES: AliasMap = {
     "budgeted cost", "budget costs", "budget cost", "estimate cost",
   ],
   actualCosts: [
-    "actual costs", "actual cost", "costs", "cost", "spent", "spent to date",
-    "incurred", "incurred costs", "actuals",
+    "actual costs", "actual cost", "total cost", "total costs",
+    "job cost", "job costs", "costs", "cost", "spent", "spent to date",
+    "incurred", "incurred costs", "actuals", "true cost", "final cost",
   ],
   status: ["status", "state", "phase", "stage", "job status", "project status"],
   startDate: [
