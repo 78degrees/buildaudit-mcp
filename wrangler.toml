@@ -1,0 +1,19 @@
+name = "buildaudit-mcp"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ENVIRONMENT = "development"
+STRIPE_PRO_PRICE_ID = "price_TBD"
+PUBLIC_BASE_URL = "http://localhost:8787"
+
+# Durable Object for per-user auth + tier state
+[durable_objects]
+bindings = [
+  { name = "USER_STATE", class_name = "UserState" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UserState"]
