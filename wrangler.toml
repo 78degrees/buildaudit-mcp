@@ -12,6 +12,8 @@ routes = [
 [vars]
 ENVIRONMENT = "production"
 STRIPE_PRO_PRICE_ID = "price_1TVizbFOBmZeyzXrtGUzkguF"
+STRIPE_AGENCY_PRICE_ID = "price_1TVizbFOBmZeyzXryl5sRgJ8"
+STRIPE_ENTERPRISE_PRICE_ID = "price_1TVizcFOBmZeyzXrs7qB0zpI"
 PUBLIC_BASE_URL = "https://api.buildaudit.dev"
 
 # Durable Object for per-user auth + tier state

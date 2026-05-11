@@ -15,6 +15,11 @@
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { createServer, type Env } from "./server.js";
 import { StripeService }          from "./services/stripe.js";
+import { handleAnalyzeJobs }      from "./tools/analyze-jobs.js";
+import { handleAuditExpenses }    from "./tools/audit-expenses.js";
+import { handleCommissionAudit }  from "./tools/commission-audit.js";
+import { handleCashFlow }         from "./tools/cash-flow.js";
+import * as XLSX                  from "xlsx";
 
 export { UserState } from "./auth/user-state.js";
 
@@ -59,18 +64,28 @@ export default {
       return htmlResponse(renderCancelPage(), 200);
     }
 
+    if (request.method === "GET" && url.pathname === "/try-free") {
+      return htmlResponse(renderTryFreePage(), 200);
+    }
+
+    if (request.method === "POST" && url.pathname === "/try-free") {
+      return handleTryFreeUpload(request);
+    }
+
     if (request.method === "GET" && url.pathname === "/health") {
       return jsonResponse({ status: "ok", service: "buildaudit-mcp", version: "0.1.0" }, 200);
     }
 
     if (request.method === "GET" && url.pathname === "/") {
+      return htmlResponse(renderDashboardPage(), 200);
+    }
+
+    if (request.method === "GET" && url.pathname === "/api-info") {
       return jsonResponse({
-        name: "BuildAudit MCP",
-        description: "Financial intelligence for contractors — job profitability, expense audit, variance alerts.",
+        name: "BuildAudit",
         version: "0.1.0",
         mcp_endpoint: "/mcp",
-        upgrade: "/upgrade",
-        tools: ["analyze_jobs", "audit_expenses", "variance_alerts"],
+        tools: ["analyze_jobs", "audit_expenses", "variance_alerts", "commission_audit", "cash_flow"],
       }, 200);
     }
 
@@ -107,12 +122,19 @@ async function handleCheckout(request: Request, env: Env): Promise<Response> {
   const url     = new URL(request.url);
   const baseUrl = env.PUBLIC_BASE_URL || `${url.protocol}//${url.host}`;
   const apiKey  = generateApiKey();
+  const tier    = (url.searchParams.get("tier") ?? "pro").toLowerCase();
+
+  // Map tier query param → Stripe price ID. Unknown values fall through to Pro.
+  const priceId =
+    tier === "agency"     ? env.STRIPE_AGENCY_PRICE_ID :
+    tier === "enterprise" ? env.STRIPE_ENTERPRISE_PRICE_ID :
+                            env.STRIPE_PRO_PRICE_ID;
 
   const stripe = new StripeService(env);
   let session;
   try {
     session = await stripe.createCheckoutSession({
-      priceId:    env.STRIPE_PRO_PRICE_ID,
+      priceId,
       apiKey,
       successUrl: `${baseUrl}/checkout/success?session_id={CHECKOUT_SESSION_ID}`,
       cancelUrl:  `${baseUrl}/checkout/cancel`,
@@ -142,8 +164,8 @@ async function handleCheckoutSuccess(request: Request, env: Env): Promise<Respon
   if (!sessionId || !sessionId.startsWith("cs_")) {
     return htmlResponse(
       renderErrorPage(
-        "Missing checkout session",
-        "This page must be opened with a `session_id` from Stripe. Start over from /upgrade.",
+        "Missing checkout info",
+        "This page needs to be opened right after checkout. Head back to the pricing page to try again.",
       ),
       400,
     );
@@ -165,8 +187,8 @@ async function handleCheckoutSuccess(request: Request, env: Env): Promise<Respon
   if (!apiKey) {
     return htmlResponse(
       renderErrorPage(
-        "Session missing API key",
-        "This checkout session has no api_key metadata — likely created outside our flow.",
+        "Something went wrong",
+        "We couldn't set up your account from this checkout session. Please try again from the pricing page, or email hello@buildaudit.dev if this keeps happening.",
       ),
       400,
     );
@@ -200,8 +222,8 @@ async function handleCheckoutSuccess(request: Request, env: Env): Promise<Respon
     console.error("[checkout/success] set-key failed:", err);
     return htmlResponse(
       renderErrorPage(
-        "Could not save your API key",
-        "Your payment went through, but we hit a snag saving the key. Email hello@buildaudit.dev with your receipt.",
+        "Account setup issue",
+        "Your payment went through, but we hit a snag setting up your account. Email hello@buildaudit.dev with your receipt and we'll get you sorted.",
       ),
       500,
     );
@@ -262,6 +284,110 @@ async function handleStripeWebhook(request: Request, env: Env): Promise<Response
   }
 
   return jsonResponse({ received: true }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Try Free — upload CSV, run the matching tool, render results inline
+// ---------------------------------------------------------------------------
+
+async function handleTryFreeUpload(request: Request): Promise<Response> {
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return htmlResponse(
+      renderErrorPage(
+        "Couldn't read upload",
+        "We expected a file upload. Try the form again.",
+      ),
+      400,
+    );
+  }
+
+  const fileEntry = formData.get("csv");
+  const type      = String(formData.get("type") ?? "jobs").toLowerCase();
+
+  if (!fileEntry || typeof fileEntry === "string") {
+    return htmlResponse(
+      renderErrorPage(
+        "No file uploaded",
+        "Pick a spreadsheet before clicking Analyze.",
+      ),
+      400,
+    );
+  }
+
+  const file = fileEntry as unknown as {
+    size: number;
+    name: string;
+    text: () => Promise<string>;
+    arrayBuffer: () => Promise<ArrayBuffer>;
+  };
+
+  if (file.size === 0) {
+    return htmlResponse(
+      renderErrorPage("Empty file", "Pick a non-empty file."),
+      400,
+    );
+  }
+
+  // Cap input at 5 MB for the free tier.
+  if (file.size > 5 * 1024 * 1024) {
+    return htmlResponse(
+      renderErrorPage(
+        "File too large",
+        "Free tier accepts files up to 5 MB. Subscribe to Pro for larger uploads.",
+      ),
+      413,
+    );
+  }
+
+  // Detect file type from extension and convert Excel → CSV if needed.
+  const ext = (file.name.split(".").pop() ?? "").toLowerCase();
+  let csvText: string;
+
+  if (ext === "xlsx" || ext === "xls" || ext === "xlsb" || ext === "ods") {
+    try {
+      const buffer = await file.arrayBuffer();
+      const workbook = XLSX.read(buffer, { type: "array" });
+      const firstSheet = workbook.SheetNames[0];
+      if (!firstSheet) {
+        return htmlResponse(
+          renderErrorPage("Empty spreadsheet", "The uploaded file has no sheets."),
+          400,
+        );
+      }
+      csvText = XLSX.utils.sheet_to_csv(workbook.Sheets[firstSheet]);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return htmlResponse(
+        renderErrorPage(
+          "Couldn't read that spreadsheet",
+          "We had trouble parsing the file. Make sure it's a valid Excel or spreadsheet file.",
+          msg,
+        ),
+        400,
+      );
+    }
+  } else {
+    // Treat everything else (csv, tsv, txt) as plain text.
+    csvText = await file.text();
+  }
+
+  // Route to the correct handler based on report type
+  let handler: (input: any, env: any, auth: any) => Promise<any>;
+  if (type === "expenses") {
+    handler = handleAuditExpenses;
+  } else if (type === "commissions") {
+    handler = handleCommissionAudit;
+  } else if (type === "cashflow") {
+    handler = handleCashFlow;
+  } else {
+    handler = handleAnalyzeJobs;
+  }
+  const result = await handler({ csv_text: csvText } as any, {} as any, {});
+
+  return htmlResponse(renderTryFreeResultPage(result, type, file.name), 200);
 }
 
 // ---------------------------------------------------------------------------
@@ -368,21 +494,401 @@ const PAGE_HEAD = /* html */ `
     padding: 0.25rem 0.625rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600;
     letter-spacing: 0.05em; text-transform: uppercase; margin-bottom: 1rem;
   }
+  /* Wider container for pricing grids + result pages */
+  .wrap-wide { width: 100%; max-width: 1080px; }
+  .pricing-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin: 1.5rem 0;
+  }
+  @media (max-width: 900px) { .pricing-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 540px) { .pricing-grid { grid-template-columns: 1fr; } }
+  .tier {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem;
+    padding: 1.25rem; display: flex; flex-direction: column;
+  }
+  .tier.featured { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .tier h3 { margin: 0 0 0.25rem; font-size: 1rem; font-weight: 600; }
+  .tier .pricing-line { display: flex; align-items: baseline; gap: 0.25rem; margin-bottom: 0.75rem; }
+  .tier .pricing-line .num { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em; }
+  .tier .pricing-line .per { color: var(--muted); font-size: 0.85rem; }
+  .tier ul { list-style: none; padding: 0; margin: 0 0 1rem; font-size: 0.85rem; flex: 1; }
+  .tier ul li {
+    color: var(--text); padding: 0.25rem 0; padding-left: 1.1rem; position: relative;
+  }
+  .tier ul li::before {
+    content: "✓"; position: absolute; left: 0; color: var(--accent-2); font-weight: 600;
+  }
+  .tier .btn { margin-top: auto; padding: 0.625rem 1rem; font-size: 0.9rem; }
+  .upload-form {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 0.75rem;
+    padding: 1.5rem; margin: 1rem 0;
+  }
+  .upload-form input[type=file] {
+    width: 100%; padding: 0.75rem; background: var(--surface-2); border: 1px dashed var(--border);
+    border-radius: 0.5rem; color: var(--text); cursor: pointer;
+  }
+  .upload-form .radio-row {
+    display: flex; gap: 1rem; margin: 1rem 0;
+  }
+  .upload-form .radio-row label {
+    display: flex; align-items: center; gap: 0.5rem; cursor: pointer;
+    padding: 0.5rem 0.75rem; border: 1px solid var(--border); border-radius: 0.5rem;
+    background: var(--surface-2);
+  }
+  .upload-form .radio-row input[type=radio] { accent-color: var(--accent); }
+  .summary-card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent); border-radius: 0.5rem;
+    padding: 1rem 1.25rem; margin: 1rem 0; font-size: 0.95rem; line-height: 1.6;
+  }
+  .stat-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.75rem; margin: 1rem 0;
+  }
+  .stat {
+    background: var(--surface-2); border: 1px solid var(--border); border-radius: 0.5rem;
+    padding: 0.75rem 1rem;
+  }
+  .stat .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat .value { font-size: 1.25rem; font-weight: 600; margin-top: 0.25rem; }
+  .stat .value.danger { color: #f87171; }
+  .stat .value.success { color: var(--success); }
 </style>
 `;
 
 function renderUpgradePage(): string {
   return /* html */ `<!doctype html><html lang="en"><head>
-  <title>BuildAudit Pro — Upgrade</title>${PAGE_HEAD}
-</head><body><div class="wrap">
-  <span class="badge">BuildAudit Pro</span>
-  <h1>Financial intelligence for <span>contractors</span>.</h1>
-  <p class="lead">Job profitability, expense audit, and variance alerts — straight from your AI assistant. Subscribe to unlock paid-tier limits.</p>
-  <div class="card">
-    <a href="/checkout" class="btn">Subscribe to Pro &rarr;</a>
+  <title>BuildAudit — Pricing</title>${PAGE_HEAD}
+</head><body><div class="wrap wrap-wide">
+  <span class="badge">Pricing</span>
+  <h1>Find the leak in your <span>job costs</span>.</h1>
+  <p class="lead">Pick a plan or try BuildAudit free by uploading a spreadsheet — no card, no signup.</p>
+
+  <div class="pricing-grid">
+
+    <div class="tier">
+      <h3>Free</h3>
+      <div class="pricing-line"><span class="num">$0</span><span class="per">one-shot upload</span></div>
+      <ul>
+        <li>Upload one spreadsheet</li>
+        <li>Profitability, expense, commission &amp; cash flow reports</li>
+        <li>Duplicate &amp; PO audit</li>
+        <li>No signup, no card</li>
+      </ul>
+      <a href="/try-free" class="btn btn-ghost">Try free &rarr;</a>
+    </div>
+
+    <div class="tier featured">
+      <h3>Pro</h3>
+      <div class="pricing-line"><span class="num">$49</span><span class="per">/ month</span></div>
+      <ul>
+        <li>Unlimited jobs &amp; expenses</li>
+        <li>Connect QuickBooks directly</li>
+        <li>Full financial dashboard</li>
+        <li>Email &amp; text alerts when jobs go over budget</li>
+      </ul>
+      <a href="/checkout?tier=pro" class="btn">Get Pro &rarr;</a>
+    </div>
+
+    <div class="tier">
+      <h3>Agency</h3>
+      <div class="pricing-line"><span class="num">$149</span><span class="per">/ month</span></div>
+      <ul>
+        <li>Everything in Pro</li>
+        <li>Up to 10 QuickBooks connections</li>
+        <li>Batch audits across clients</li>
+        <li>Branded PDF reports</li>
+      </ul>
+      <a href="/checkout?tier=agency" class="btn">Get Agency &rarr;</a>
+    </div>
+
+    <div class="tier">
+      <h3>Enterprise</h3>
+      <div class="pricing-line"><span class="num">$499</span><span class="per">/ month</span></div>
+      <ul>
+        <li>Unlimited clients</li>
+        <li>Custom audit rules &amp; cost codes</li>
+        <li>White-label reports with your branding</li>
+        <li>Priority support</li>
+      </ul>
+      <a href="/checkout?tier=enterprise" class="btn">Get Enterprise &rarr;</a>
+    </div>
+
   </div>
-  <h2>What you get</h2>
-  <p>After payment we generate a fresh <code>ba_…</code> API key, link it to your subscription, and show it on the next screen with install instructions.</p>
+
+  <h2>What happens after you sign up</h2>
+  <p>After payment you'll get immediate access to your BuildAudit account. Connect QuickBooks, upload your job data, and start seeing results right away.</p>
+</div></body></html>`;
+}
+
+function renderTryFreePage(): string {
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — Try free</title>${PAGE_HEAD}
+</head><body><div class="wrap">
+  <span class="badge">Free — no signup</span>
+  <h1>Drop in a <span>spreadsheet</span> and see what's bleeding.</h1>
+  <p class="lead">Export jobs or expenses from QuickBooks, Excel, Google Sheets — anywhere. We accept .xlsx, .xls, .csv, and .ods files and fuzzy-match the headers (Project, Work Order, Job Name… all map to the same field).</p>
+
+  <form class="upload-form" method="POST" action="/try-free" enctype="multipart/form-data">
+
+    <label for="csv-file"><strong>Pick a spreadsheet</strong></label>
+    <p style="font-size: 0.85rem; margin: 0.5rem 0 1rem;">Up to 5 MB. Stays in this browser session — nothing is stored on our servers in the free tier.</p>
+    <input id="csv-file" type="file" name="csv" accept=".csv,.xlsx,.xls,.xlsb,.ods,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" required>
+
+    <div class="radio-row" style="flex-wrap: wrap;">
+      <label><input type="radio" name="type" value="jobs" checked> Job profitability</label>
+      <label><input type="radio" name="type" value="expenses"> Expense audit</label>
+      <label><input type="radio" name="type" value="commissions"> Commission check</label>
+      <label><input type="radio" name="type" value="cashflow"> Cash flow forecast</label>
+    </div>
+
+    <button type="submit" class="btn">Analyze &rarr;</button>
+  </form>
+
+  <h2>What to expect</h2>
+  <ul style="list-style: none; padding-left: 0;">
+    <li style="padding: 0.25rem 0;">— <strong>Job profitability</strong> → ranking by profit + jobs losing money + margin distribution + total exposure on underwater jobs.</li>
+    <li style="padding: 0.25rem 0;">— <strong>Expense audit</strong> → unaudited spend (no PO) + spend by vendor + unassigned expenses + duplicate detection + cost-code consistency.</li>
+    <li style="padding: 0.25rem 0;">— <strong>Commission check</strong> → flags every job where commission was paid below your margin floor + catches same-week rate inconsistencies.</li>
+    <li style="padding: 0.25rem 0;">— <strong>Cash flow forecast</strong> → projects your cash position over the next 90 days, week by week, and warns you before it goes negative.</li>
+  </ul>
+
+  <h2>Required columns (fuzzy-matched)</h2>
+  <p style="font-size: 0.9rem;"><strong>Jobs:</strong> Job Name (or "Project", "Work Order"…), Estimated Revenue, Actual Revenue, Estimated Costs, Actual Costs, Status, Start Date, End Date.</p>
+  <p style="font-size: 0.9rem;"><strong>Expenses:</strong> Vendor (or "Supplier", "Payee"…), Amount (or "Total", "Cost"…), Date, Job Name, PO (or "Has PO", "PO Number"…), Cost Code, Description.</p>
+
+  <p style="margin-top: 2rem; font-size: 0.9rem;">Want unlimited uploads + QuickBooks connection + ongoing monitoring? <a href="/upgrade" style="color: var(--accent-2);">See plans &rarr;</a></p>
+</div></body></html>`;
+}
+
+function renderTryFreeResultPage(
+  result: { content: [{ type: string; text: string }]; isError?: boolean },
+  type: string,
+  filename: string,
+): string {
+  const safeName = escapeHtml(filename);
+  const headline =
+    type === "expenses"     ? "Expense audit" :
+    type === "commissions"  ? "Commission audit" :
+    type === "cashflow"     ? "Cash flow forecast" :
+                              "Job profitability scan";
+
+  if (result.isError) {
+    let detail = "";
+    try {
+      const e = JSON.parse(result.content[0].text);
+      detail = `${e.error}: ${e.message}`;
+    } catch {
+      detail = result.content[0].text;
+    }
+    const typeLabel = type === "expenses" ? "expenses" : type === "commissions" ? "commissions" : type === "cashflow" ? "cash flow" : "jobs";
+    return renderErrorPage(
+      "Couldn't parse that file",
+      `We tried to analyze ${safeName} as a ${escapeHtml(typeLabel)} export, but something went sideways.`,
+      detail,
+    );
+  }
+
+  let parsed: any = {};
+  try {
+    parsed = JSON.parse(result.content[0].text);
+  } catch {
+    parsed = {};
+  }
+
+  const summary = escapeHtml(parsed.summary ?? "");
+
+  // Build stat grid + body specific to each tool
+  let stats: string[] = [];
+  let body = "";
+
+  if (type === "commissions") {
+    stats = [
+      `<div class="stat"><div class="label">Jobs analyzed</div><div class="value">${parsed.total_jobs ?? 0}</div></div>`,
+      `<div class="stat"><div class="label">Below margin floor</div><div class="value danger">${parsed.jobs_below_floor ?? 0}</div></div>`,
+      `<div class="stat"><div class="label">Commission exposure</div><div class="value danger">${formatMoney(parsed.commission_exposure)}</div></div>`,
+      `<div class="stat"><div class="label">Margin floor</div><div class="value">${formatPct(parsed.margin_floor_used)}</div></div>`,
+    ];
+
+    const flagged = (parsed.flagged_jobs ?? []).slice(0, 10);
+    body += flagged.length > 0
+      ? `<h2>Jobs where commission shouldn't have been paid</h2>
+         <table style="width:100%; border-collapse: collapse; font-size:0.9rem; margin: 0.5rem 0 1.5rem;">
+           <thead><tr style="text-align:left; color: var(--muted); border-bottom: 1px solid var(--border);">
+             <th style="padding:0.5rem 0.25rem;">Job</th><th>Revenue</th><th>Margin</th><th>Commission paid</th>
+           </tr></thead><tbody>
+           ${flagged.map((j: any) => `
+             <tr style="border-bottom: 1px solid var(--border);">
+               <td style="padding:0.5rem 0.25rem;">${escapeHtml(j.jobName)}</td>
+               <td>${formatMoney(j.actualRevenue)}</td>
+               <td style="color:#f87171;">${formatPct(j.margin)}</td>
+               <td style="color:#f87171;">${formatMoney(j.commissionPaid)}</td>
+             </tr>`).join("")}
+         </tbody></table>`
+      : `<p style="color: var(--success); font-size: 0.95rem;">All commissioned jobs meet your margin threshold.</p>`;
+
+    const inconsistencies = (parsed.rate_inconsistencies ?? []).slice(0, 5);
+    if (inconsistencies.length > 0) {
+      body += `<h2>Same-week rate inconsistencies</h2>
+        <ul style="font-size: 0.9rem;">
+          ${inconsistencies.map((r: any) => `<li style="padding: 0.25rem 0;">Week of ${escapeHtml(r.week)}: ${formatPct(r.spread)} spread across ${(r.jobs ?? []).length} jobs</li>`).join("")}
+        </ul>`;
+    }
+  } else if (type === "cashflow") {
+    stats = [
+      `<div class="stat"><div class="label">Projected inflows</div><div class="value success">${formatMoney(parsed.total_projected_inflows)}</div></div>`,
+      `<div class="stat"><div class="label">Projected outflows</div><div class="value danger">${formatMoney(parsed.total_projected_outflows)}</div></div>`,
+      `<div class="stat"><div class="label">Lowest balance</div><div class="value ${(parsed.lowest_balance ?? 0) < 0 ? "danger" : ""}">${formatMoney(parsed.lowest_balance)}</div></div>`,
+      `<div class="stat"><div class="label">Days until negative</div><div class="value ${parsed.days_until_negative ? "danger" : "success"}">${parsed.days_until_negative ?? "Never"}</div></div>`,
+    ];
+
+    const timeline = (parsed.weekly_timeline ?? []).slice(0, 13);
+    if (timeline.length > 0) {
+      body += `<h2>Weekly cash flow</h2>
+        <table style="width:100%; border-collapse: collapse; font-size:0.9rem; margin: 0.5rem 0 1.5rem;">
+          <thead><tr style="text-align:left; color: var(--muted); border-bottom: 1px solid var(--border);">
+            <th style="padding:0.5rem 0.25rem;">Week</th><th>In</th><th>Out</th><th>Net</th><th>Balance</th>
+          </tr></thead><tbody>
+          ${timeline.map((w: any) => `
+            <tr style="border-bottom: 1px solid var(--border);">
+              <td style="padding:0.5rem 0.25rem;">${escapeHtml(w.week)}</td>
+              <td style="color: var(--success);">${formatMoney(w.inflows)}</td>
+              <td style="color:#f87171;">${formatMoney(w.outflows)}</td>
+              <td style="color:${(w.net ?? 0) >= 0 ? "var(--success)" : "#f87171"};">${formatMoney(w.net)}</td>
+              <td style="color:${(w.running_balance ?? 0) >= 0 ? "var(--text)" : "#f87171"}; font-weight:600;">${formatMoney(w.running_balance)}</td>
+            </tr>`).join("")}
+        </tbody></table>`;
+    }
+  } else if (type === "jobs" || type !== "expenses") {
+    stats = [
+      `<div class="stat"><div class="label">Jobs analyzed</div><div class="value">${parsed.count_total ?? 0}</div></div>`,
+      `<div class="stat"><div class="label">Underwater</div><div class="value danger">${parsed.count_underwater ?? 0}</div></div>`,
+      `<div class="stat"><div class="label">Total exposure</div><div class="value danger">${formatMoney(parsed.total_exposure_underwater)}</div></div>`,
+      `<div class="stat"><div class="label">Average margin</div><div class="value ${(parsed.average_margin ?? 0) >= 0 ? "success" : "danger"}">${formatPct(parsed.average_margin)}</div></div>`,
+    ];
+
+    const losers = (parsed.jobs_losing_money ?? []).slice(0, 10);
+    body += losers.length > 0
+      ? `<h2>Jobs losing money</h2>
+         <table style="width:100%; border-collapse: collapse; font-size:0.9rem; margin: 0.5rem 0 1.5rem;">
+           <thead><tr style="text-align:left; color: var(--muted); border-bottom: 1px solid var(--border);">
+             <th style="padding:0.5rem 0.25rem;">Job</th><th>Revenue</th><th>Costs</th><th>Profit</th><th>Margin</th>
+           </tr></thead><tbody>
+           ${losers.map((j: any) => `
+             <tr style="border-bottom: 1px solid var(--border);">
+               <td style="padding:0.5rem 0.25rem;">${escapeHtml(j.jobName)}</td>
+               <td>${formatMoney(j.actualRevenue)}</td>
+               <td>${formatMoney(j.actualCosts)}</td>
+               <td style="color:#f87171;">${formatMoney(j.profit)}</td>
+               <td style="color:#f87171;">${formatPct(j.margin)}</td>
+             </tr>`).join("")}
+         </tbody></table>`
+      : `<p style="color: var(--success); font-size: 0.95rem;">No jobs underwater — every job is at least breaking even.</p>`;
+
+    const ranked = (parsed.profitability_ranking ?? []).slice(0, 5);
+    if (ranked.length > 0) {
+      body += `<h2>Top 5 by profit</h2>
+        <ol style="font-size: 0.9rem;">
+          ${ranked.map((j: any) => `<li style="padding: 0.25rem 0;">${escapeHtml(j.jobName)} — ${formatMoney(j.profit)} (${formatPct(j.margin)})</li>`).join("")}
+        </ol>`;
+    }
+  } else {
+    stats = [
+      `<div class="stat"><div class="label">Expenses</div><div class="value">${parsed.total_expenses ?? 0}</div></div>`,
+      `<div class="stat"><div class="label">Unaudited spend</div><div class="value danger">${formatMoney(parsed.total_unaudited_spend)}</div></div>`,
+      `<div class="stat"><div class="label">Unassigned</div><div class="value">${(parsed.unassigned_expenses ?? []).length}</div></div>`,
+      `<div class="stat"><div class="label">Duplicate groups</div><div class="value danger">${(parsed.duplicates ?? []).length}</div></div>`,
+    ];
+
+    const dups = (parsed.duplicates ?? []).slice(0, 10);
+    body += dups.length > 0
+      ? `<h2>Possible duplicates</h2>
+         <table style="width:100%; border-collapse: collapse; font-size:0.9rem; margin: 0.5rem 0 1.5rem;">
+           <thead><tr style="text-align:left; color: var(--muted); border-bottom: 1px solid var(--border);">
+             <th style="padding:0.5rem 0.25rem;">Vendor</th><th>Amount</th><th>Count</th><th>Dates</th>
+           </tr></thead><tbody>
+           ${dups.map((g: any) => `
+             <tr style="border-bottom: 1px solid var(--border);">
+               <td style="padding:0.5rem 0.25rem;">${escapeHtml(g.vendor)}</td>
+               <td>${formatMoney(g.amount)}</td>
+               <td>${g.count}</td>
+               <td>${escapeHtml((g.dates ?? []).join(", "))}</td>
+             </tr>`).join("")}
+         </tbody></table>`
+      : `<p style="color: var(--success); font-size: 0.95rem;">No duplicate groups detected within the 7-day window.</p>`;
+
+    const byVendor = (parsed.expenses_by_vendor ?? []).slice(0, 5);
+    if (byVendor.length > 0) {
+      body += `<h2>Top vendors by spend</h2>
+        <ol style="font-size: 0.9rem;">
+          ${byVendor.map((v: any) => `<li style="padding: 0.25rem 0;">${escapeHtml(v.vendor)} — ${formatMoney(v.total)} across ${v.count} expense(s)</li>`).join("")}
+        </ol>`;
+    }
+  }
+
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — ${escapeHtml(headline)}</title>${PAGE_HEAD}
+</head><body><div class="wrap">
+  <span class="badge">${escapeHtml(headline)}</span>
+  <h1>Here's what we found in <span>${safeName}</span>.</h1>
+
+  <div class="summary-card">${summary}</div>
+
+  <div class="stat-grid">${stats.join("")}</div>
+
+  ${body}
+
+  <h2>Want this on every job, automatically?</h2>
+  <p>Pro plan ($49/mo) unlocks unlimited uploads, QuickBooks connection, ongoing monitoring, and email alerts when jobs go over budget.</p>
+  <a href="/upgrade" class="btn">See plans &rarr;</a>
+
+  <p style="margin-top: 1.5rem; font-size: 0.85rem;"><a href="/try-free" style="color: var(--muted);">&larr; Try another file</a></p>
+</div></body></html>`;
+}
+
+function formatMoney(n: unknown): string {
+  if (typeof n !== "number" || !isFinite(n)) return "—";
+  const abs = Math.abs(n);
+  const sign = n < 0 ? "-" : "";
+  return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function formatPct(n: unknown): string {
+  if (typeof n !== "number" || !isFinite(n)) return "—";
+  const sign = n < 0 ? "-" : "";
+  return `${sign}${Math.abs(n * 100).toFixed(2)}%`;
+}
+
+function renderDashboardPage(): string {
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — Dashboard</title>${PAGE_HEAD}
+</head><body><div class="wrap">
+  <span class="badge">BuildAudit</span>
+  <h1>Your financial <span>command center</span>.</h1>
+  <p class="lead">Upload a spreadsheet to get an instant audit, or choose a report type below.</p>
+
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 2rem 0;">
+    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+      <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Job profitability</h3>
+      <p style="font-size: 0.85rem; margin: 0;">See which jobs are making money and which are underwater.</p>
+    </a>
+    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+      <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Expense audit</h3>
+      <p style="font-size: 0.85rem; margin: 0;">Find missing POs, duplicates, and unassigned expenses.</p>
+    </a>
+    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+      <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Commission check</h3>
+      <p style="font-size: 0.85rem; margin: 0;">Flag jobs where commission was paid below your margin floor.</p>
+    </a>
+    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+      <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Cash flow forecast</h3>
+      <p style="font-size: 0.85rem; margin: 0;">See where your cash is headed over the next 90 days.</p>
+    </a>
+  </div>
+
+  <div style="display: flex; gap: 1rem; margin-top: 1rem;">
+    <a href="/try-free" class="btn" style="flex:1;">Upload a spreadsheet &rarr;</a>
+    <a href="/upgrade" class="btn btn-ghost" style="flex:1;">See plans</a>
+  </div>
 </div></body></html>`;
 }
 
@@ -390,36 +896,25 @@ function renderSuccessPage(apiKey: string, paid: boolean): string {
   const safeKey = escapeHtml(apiKey);
   const head = paid ? `Welcome to <span>BuildAudit Pro</span>.` : `Your account is set up.`;
   const sub = paid
-    ? "Your API key is ready. Add it to your environment and your AI assistant will start hitting paid-tier endpoints immediately."
-    : "Your subscription isn't active yet, but your key is reserved. Check Stripe to confirm the payment.";
+    ? "You're all set. Your account is active and ready to use. Save your account key below — you'll need it to log in."
+    : "Your subscription isn't active yet, but your account is reserved. Check your email for a payment confirmation.";
 
   return /* html */ `<!doctype html><html lang="en"><head>
-  <title>BuildAudit — Your API Key</title>${PAGE_HEAD}
+  <title>BuildAudit — Welcome</title>${PAGE_HEAD}
 </head><body><div class="wrap">
   <span class="badge">${paid ? "Subscription active" : "Pending"}</span>
   <h1>${head}</h1>
   <p class="lead">${sub}</p>
 
-  <h2>Your API key</h2>
+  <h2>Your account key</h2>
   <div class="key-box">
     <code id="apiKey">${safeKey}</code>
     <button class="copy-btn" id="copyBtn" onclick="copyKey()">Copy</button>
   </div>
-  <p style="font-size:0.85rem;">Save this somewhere safe. Treat it like a password.</p>
+  <p style="font-size:0.85rem;">Save this somewhere safe — you'll need it to access your account. Treat it like a password.</p>
 
-  <h2>Install instructions</h2>
-  <pre>export BUILDAUDIT_API_KEY=${safeKey}</pre>
-
-  <h2>MCP client config</h2>
-  <pre>{
-  "mcpServers": {
-    "buildaudit": {
-      "transport": "http",
-      "url": "${escapeHtml("https://api.buildaudit.dev/mcp")}",
-      "headers": { "Authorization": "Bearer ${safeKey}" }
-    }
-  }
-}</pre>
+  <h2>What's next</h2>
+  <p>Head to your <a href="/" style="color: var(--accent-2);">BuildAudit dashboard</a> to connect QuickBooks or upload your first file. Your account is live and ready to go.</p>
 
   <script>
     function copyKey() {

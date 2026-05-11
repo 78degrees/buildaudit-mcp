@@ -15,10 +15,14 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { analyzeJobsSchema }      from "./schemas/analyze-jobs.js";
 import { auditExpensesSchema }    from "./schemas/audit-expenses.js";
 import { varianceAlertsSchema }   from "./schemas/variance-alerts.js";
+import { commissionAuditSchema }  from "./schemas/commission-audit.js";
+import { cashFlowSchema }         from "./schemas/cash-flow.js";
 
 import { handleAnalyzeJobs }      from "./tools/analyze-jobs.js";
 import { handleAuditExpenses }    from "./tools/audit-expenses.js";
 import { handleVarianceAlerts }   from "./tools/variance-alerts.js";
+import { handleCommissionAudit }  from "./tools/commission-audit.js";
+import { handleCashFlow }         from "./tools/cash-flow.js";
 
 import { authenticateRequest }    from "./middleware/auth.js";
 import { toMcpError }             from "./utils/errors.js";
@@ -31,6 +35,8 @@ export interface Env {
   STRIPE_SECRET_KEY: string;
   STRIPE_WEBHOOK_SECRET: string;
   STRIPE_PRO_PRICE_ID: string;
+  STRIPE_AGENCY_PRICE_ID: string;
+  STRIPE_ENTERPRISE_PRICE_ID: string;
   PUBLIC_BASE_URL: string;
   USER_STATE: DurableObjectNamespace;
 }
@@ -92,6 +98,20 @@ export function createServer(env: Env, request: Request): McpServer {
     "Flag jobs whose actual costs exceed estimated costs by more than a threshold (default 25%). Returns alerts sorted by severity.",
     varianceAlertsSchema.shape,
     withMiddleware(handleVarianceAlerts, env, request)
+  );
+
+  server.tool(
+    "commission_audit",
+    "Audit commission payments against margin thresholds. Flags jobs where commission was paid below the minimum margin floor, detects same-week rate inconsistencies, and calculates total commission exposure.",
+    commissionAuditSchema.shape,
+    withMiddleware(handleCommissionAudit, env, request)
+  );
+
+  server.tool(
+    "cash_flow",
+    "Project cash flow over the next 90 days based on active jobs. Shows weekly inflows/outflows, identifies when cash might go negative, and calculates total projected cash position.",
+    cashFlowSchema.shape,
+    withMiddleware(handleCashFlow, env, request)
   );
 
   return server;
