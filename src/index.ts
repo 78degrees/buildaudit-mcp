@@ -94,7 +94,15 @@ export default {
     }
 
     if (request.method === "GET" && url.pathname === "/") {
-      return htmlResponse(renderDashboardPage(), 200);
+      return handleDashboard(request, env);
+    }
+
+    if (request.method === "POST" && url.pathname === "/login") {
+      return handleLogin(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/logout") {
+      return handleLogout();
     }
 
     if (request.method === "GET" && url.pathname === "/api-info") {
@@ -587,6 +595,108 @@ async function handleQbStatus(request: Request, env: Env): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard — login gate + personalized view
+// ---------------------------------------------------------------------------
+
+function getApiKeyFromCookie(request: Request): string | null {
+  const cookie = request.headers.get("Cookie") ?? "";
+  const match = cookie.match(/(?:^|;\s*)ba_key=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+async function handleDashboard(request: Request, env: Env): Promise<Response> {
+  const apiKey = getApiKeyFromCookie(request);
+
+  if (!apiKey || !apiKey.startsWith("ba_")) {
+    return htmlResponse(renderLoginPage(), 200);
+  }
+
+  // Fetch user state from DO
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  let userInfo: { tier?: string; email?: string } = {};
+  let qbStatus: { connected: boolean; realmId?: string; connectedAt?: number } = { connected: false };
+
+  try {
+    const r = await stub.fetch(new Request("https://user-state/validate-key"));
+    if (r.ok) {
+      const data = await r.json<any>();
+      userInfo = { tier: data.tier, email: data.email };
+    } else {
+      // Invalid key — clear cookie and show login
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: "/",
+          "Set-Cookie": "ba_key=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+        },
+      });
+    }
+  } catch {
+    // DO error — still show dashboard but with limited info
+  }
+
+  try {
+    const r = await stub.fetch(new Request("https://user-state/get-qb-tokens"));
+    if (r.ok) {
+      const data = await r.json<any>();
+      qbStatus = { connected: data.connected, realmId: data.realmId, connectedAt: data.connectedAt };
+    }
+  } catch {
+    // QB status unavailable — leave as disconnected
+  }
+
+  return htmlResponse(renderDashboardPage(apiKey, userInfo, qbStatus), 200);
+}
+
+async function handleLogin(request: Request, env: Env): Promise<Response> {
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return htmlResponse(renderLoginPage("Couldn't read form. Try again."), 400);
+  }
+
+  const apiKey = String(formData.get("api_key") ?? "").trim();
+  if (!apiKey || !apiKey.startsWith("ba_")) {
+    return htmlResponse(renderLoginPage("That doesn't look like a valid account key. It should start with ba_."), 400);
+  }
+
+  // Verify the key exists in DO
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  try {
+    const r = await stub.fetch(new Request("https://user-state/validate-key"));
+    if (!r.ok) {
+      return htmlResponse(renderLoginPage("We couldn't find an account with that key. Double-check and try again."), 400);
+    }
+    const data = await r.json<any>();
+    if (!data.valid) {
+      return htmlResponse(renderLoginPage("That key doesn't have an active account yet."), 400);
+    }
+  } catch {
+    return htmlResponse(renderLoginPage("Something went wrong verifying your key. Try again in a moment."), 500);
+  }
+
+  // Set cookie and redirect to dashboard
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": `ba_key=${encodeURIComponent(apiKey)}; Path=/; Max-Age=${60 * 60 * 24 * 90}; HttpOnly; Secure; SameSite=Lax`,
+    },
+  });
+}
+
+function handleLogout(): Response {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      Location: "/",
+      "Set-Cookie": "ba_key=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax",
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
 // DO helpers
 // ---------------------------------------------------------------------------
 
@@ -1054,15 +1164,79 @@ function formatPct(n: unknown): string {
   return `${sign}${Math.abs(n * 100).toFixed(2)}%`;
 }
 
-function renderDashboardPage(): string {
+function renderLoginPage(error?: string): string {
+  const errorHtml = error
+    ? `<div style="background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.3); border-radius: 0.5rem; padding: 0.75rem 1rem; margin-bottom: 1.5rem; color: #f87171; font-size: 0.9rem;">${escapeHtml(error)}</div>`
+    : "";
+  return /* html */ `<!doctype html><html lang="en"><head>
+  <title>BuildAudit — Log in</title>${PAGE_HEAD}
+</head><body><div class="wrap" style="max-width: 440px;">
+  <span class="badge">BuildAudit</span>
+  <h1>Log in to your <span>dashboard</span>.</h1>
+  <p class="lead">Paste the account key you received after checkout.</p>
+
+  ${errorHtml}
+
+  <form method="POST" action="/login" style="margin: 1.5rem 0;">
+    <label for="api_key" style="font-size: 0.85rem; font-weight: 600; display: block; margin-bottom: 0.5rem;">Account key</label>
+    <input id="api_key" name="api_key" type="text" placeholder="ba_0ea7aa870..." required
+      style="width: 100%; padding: 0.875rem 1rem; background: var(--surface-2); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 0.9rem; margin-bottom: 1rem;">
+    <button type="submit" class="btn">Log in &rarr;</button>
+  </form>
+
+  <p style="font-size: 0.85rem; color: var(--muted);">Don't have an account? <a href="/upgrade" style="color: var(--accent-2);">See plans &rarr;</a></p>
+  <p style="font-size: 0.85rem; color: var(--muted);">Just want to try it? <a href="/try-free" style="color: var(--accent-2);">Upload a spreadsheet free &rarr;</a></p>
+</div></body></html>`;
+}
+
+function renderDashboardPage(
+  apiKey: string,
+  user: { tier?: string; email?: string },
+  qb: { connected: boolean; realmId?: string; connectedAt?: number },
+): string {
+  const tierLabel = user.tier === "paid" ? "Pro" : "Free";
+  const emailDisplay = user.email ? escapeHtml(user.email) : "—";
+  const maskedKey = apiKey.slice(0, 7) + "•••" + apiKey.slice(-4);
+
+  const qbSection = qb.connected
+    ? `<div class="card" style="border-left: 3px solid var(--success); margin-bottom: 1.5rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <h3 style="margin: 0 0 0.25rem; font-size: 1rem; color: var(--success);">QuickBooks connected</h3>
+            <p style="font-size: 0.85rem; margin: 0;">Company ID: ${escapeHtml(qb.realmId ?? "—")}</p>
+          </div>
+          <a href="/qb/disconnect?api_key=${encodeURIComponent(apiKey)}" class="btn btn-ghost" style="width: auto; padding: 0.5rem 1rem; font-size: 0.85rem;">Disconnect</a>
+        </div>
+       </div>`
+    : `<div class="card" style="border-left: 3px solid var(--accent); margin-bottom: 1.5rem;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <div>
+            <h3 style="margin: 0 0 0.25rem; font-size: 1rem;">Connect QuickBooks</h3>
+            <p style="font-size: 0.85rem; margin: 0;">Pull jobs and expenses directly — no more spreadsheet exports.</p>
+          </div>
+          <a href="/qb/connect?api_key=${encodeURIComponent(apiKey)}" class="btn" style="width: auto; padding: 0.5rem 1rem; font-size: 0.85rem;">Connect &rarr;</a>
+        </div>
+       </div>`;
+
   return /* html */ `<!doctype html><html lang="en"><head>
   <title>BuildAudit — Dashboard</title>${PAGE_HEAD}
 </head><body><div class="wrap">
-  <span class="badge">BuildAudit</span>
-  <h1>Your financial <span>command center</span>.</h1>
-  <p class="lead">Upload a spreadsheet to get an instant audit, or choose a report type below.</p>
 
-  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 2rem 0;">
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+    <div>
+      <span class="badge">${escapeHtml(tierLabel)} plan</span>
+      <h1 style="margin-bottom: 0.25rem;">Your <span>dashboard</span>.</h1>
+      <p style="font-size: 0.85rem; margin: 0;">${emailDisplay} &middot; ${escapeHtml(maskedKey)}</p>
+    </div>
+    <a href="/logout" style="color: var(--muted); font-size: 0.85rem; text-decoration: none;">Log out</a>
+  </div>
+
+  ${qbSection}
+
+  <h2 style="margin-top: 0;">Run a report</h2>
+  <p style="font-size: 0.9rem;">Upload a spreadsheet or pull from QuickBooks to run any of these audits.</p>
+
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0;">
     <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
       <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Job profitability</h3>
       <p style="font-size: 0.85rem; margin: 0;">See which jobs are making money and which are underwater.</p>
@@ -1081,10 +1255,8 @@ function renderDashboardPage(): string {
     </a>
   </div>
 
-  <div style="display: flex; gap: 1rem; margin-top: 1rem;">
-    <a href="/try-free" class="btn" style="flex:1;">Upload a spreadsheet &rarr;</a>
-    <a href="/upgrade" class="btn btn-ghost" style="flex:1;">See plans</a>
-  </div>
+  <a href="/try-free" class="btn" style="margin-top: 0.5rem;">Upload a spreadsheet &rarr;</a>
+
 </div></body></html>`;
 }
 
@@ -1110,7 +1282,7 @@ function renderSuccessPage(apiKey: string, paid: boolean): string {
   <p style="font-size:0.85rem;">Save this somewhere safe — you'll need it to access your account. Treat it like a password.</p>
 
   <h2>What's next</h2>
-  <p>Head to your <a href="/" style="color: var(--accent-2);">BuildAudit dashboard</a> to connect QuickBooks or upload your first file. Your account is live and ready to go.</p>
+  <p>Head to your <a href="/" style="color: var(--accent-2);">BuildAudit dashboard</a> and paste this key to log in. From there you can connect QuickBooks or upload your first file.</p>
 
   <script>
     function copyKey() {
