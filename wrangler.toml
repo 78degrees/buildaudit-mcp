@@ -20,7 +20,7 @@ PUBLIC_BASE_URL = "https://api.buildaudit.dev"
 # Secrets (QUICKBOOKS_CLIENT_ID, QUICKBOOKS_CLIENT_SECRET, QUICKBOOKS_STATE_SECRET)
 # are uploaded via `wrangler secret put`, not declared here.
 QUICKBOOKS_REDIRECT_URI = "https://api.buildaudit.dev/qb/callback"
-QUICKBOOKS_ENVIRONMENT = "production"
+QUICKBOOKS_ENVIRONMENT = "sandbox"
 
 # Durable Object for per-user auth + tier state
 [durable_objects]
