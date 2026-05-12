@@ -89,6 +89,10 @@ export default {
       return handleQbStatus(request, env);
     }
 
+    if (request.method === "GET" && url.pathname === "/report") {
+      return handleReport(request, env);
+    }
+
     if (request.method === "GET" && url.pathname === "/health") {
       return jsonResponse({ status: "ok", service: "buildaudit-mcp", version: "0.1.0" }, 200);
     }
@@ -254,7 +258,18 @@ async function handleCheckoutSuccess(request: Request, env: Env): Promise<Respon
     );
   }
 
-  return htmlResponse(renderSuccessPage(apiKey, paid), 200);
+  // Auto-set login cookie so the customer never has to paste the key manually
+  const successHtml = renderSuccessPage(apiKey, paid);
+  return new Response(successHtml, {
+    status: 200,
+    headers: {
+      "Content-Type":           "text/html; charset=utf-8",
+      "Cache-Control":          "no-store",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy":        "strict-origin-when-cross-origin",
+      "Set-Cookie":             `ba_key=${encodeURIComponent(apiKey)}; Path=/; Max-Age=${60 * 60 * 24 * 90}; HttpOnly; Secure; SameSite=Lax`,
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -592,6 +607,115 @@ async function handleQbStatus(request: Request, env: Env): Promise<Response> {
     realm_id:     s.realmId,
     connected_at: s.connectedAt,
   }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// Report — pull from QuickBooks, run analysis, render results
+// ---------------------------------------------------------------------------
+
+async function handleReport(request: Request, env: Env): Promise<Response> {
+  const apiKey = getApiKeyFromCookie(request);
+  if (!apiKey) {
+    return new Response(null, { status: 302, headers: { Location: "/" } });
+  }
+
+  const type = new URL(request.url).searchParams.get("type") ?? "jobs";
+
+  // Get QB tokens from DO
+  const stub = env.USER_STATE.get(env.USER_STATE.idFromName(apiKey));
+  let qbData: any;
+  try {
+    const r = await stub.fetch(new Request("https://user-state/get-qb-tokens"));
+    if (!r.ok) throw new Error(`DO returned ${r.status}`);
+    qbData = await r.json();
+  } catch {
+    return htmlResponse(
+      renderErrorPage("Couldn't load your account", "Try logging in again.", undefined),
+      500,
+    );
+  }
+
+  if (!qbData.connected || !qbData.accessToken || !qbData.realmId) {
+    return htmlResponse(
+      renderErrorPage(
+        "QuickBooks not connected",
+        "Connect your QuickBooks file first, then come back to run reports.",
+      ),
+      400,
+    );
+  }
+
+  const qb = new QuickBooksService(env);
+
+  // Auto-refresh token if expired
+  let accessToken = qbData.accessToken;
+  if (qbData.accessTokenExpiresAt && Date.now() > qbData.accessTokenExpiresAt - 60_000) {
+    try {
+      const fresh = await qb.refreshTokens(qbData.refreshToken, qbData.realmId);
+      accessToken = fresh.accessToken;
+      // Persist refreshed tokens
+      await stub.fetch(new Request("https://user-state/set-qb-tokens", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          realmId:              fresh.realmId,
+          accessToken:          fresh.accessToken,
+          refreshToken:         fresh.refreshToken,
+          accessTokenExpiresAt: fresh.accessTokenExpiresAt,
+        }),
+      }));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Unknown error";
+      return htmlResponse(
+        renderErrorPage(
+          "QuickBooks session expired",
+          "We couldn't refresh your QuickBooks connection. Try disconnecting and reconnecting.",
+          msg,
+        ),
+        502,
+      );
+    }
+  }
+
+  // Pull data from QuickBooks based on report type
+  try {
+    let result: any;
+    let reportLabel: string;
+
+    if (type === "expenses") {
+      const expenses = await qb.fetchExpenses(accessToken, qbData.realmId);
+      // Convert to CSV-like format for the handler
+      result = await handleAuditExpenses({ expenses } as any, {} as any, {});
+      reportLabel = "expenses";
+    } else if (type === "commissions") {
+      const jobs = await qb.fetchJobs(accessToken, qbData.realmId);
+      result = await handleCommissionAudit({ jobs } as any, {} as any, {});
+      reportLabel = "commissions";
+    } else if (type === "cashflow") {
+      const jobs = await qb.fetchJobs(accessToken, qbData.realmId);
+      result = await handleCashFlow({ jobs } as any, {} as any, {});
+      reportLabel = "cashflow";
+    } else {
+      const jobs = await qb.fetchJobs(accessToken, qbData.realmId);
+      result = await handleAnalyzeJobs({ jobs } as any, {} as any, {});
+      reportLabel = "jobs";
+    }
+
+    return htmlResponse(
+      renderTryFreeResultPage(result, reportLabel, "QuickBooks"),
+      200,
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    return htmlResponse(
+      renderErrorPage(
+        "Couldn't pull your data",
+        "Something went wrong reading from QuickBooks. This could be a temporary issue with Intuit's servers.",
+        msg,
+      ),
+      502,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,38 +1358,43 @@ function renderDashboardPage(
   ${qbSection}
 
   <h2 style="margin-top: 0;">Run a report</h2>
-  <p style="font-size: 0.9rem;">Upload a spreadsheet or pull from QuickBooks to run any of these audits.</p>
+  ${qb.connected
+    ? `<p style="font-size: 0.9rem;">Click any report to pull live data from your QuickBooks file.</p>`
+    : `<p style="font-size: 0.9rem;">Connect QuickBooks above to pull data automatically, or upload a spreadsheet.</p>`
+  }
 
   <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin: 1rem 0;">
-    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+    <a href="${qb.connected ? "/report?type=jobs" : "/try-free"}" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
       <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Job profitability</h3>
       <p style="font-size: 0.85rem; margin: 0;">See which jobs are making money and which are underwater.</p>
     </a>
-    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+    <a href="${qb.connected ? "/report?type=expenses" : "/try-free"}" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
       <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Expense audit</h3>
       <p style="font-size: 0.85rem; margin: 0;">Find missing POs, duplicates, and unassigned expenses.</p>
     </a>
-    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+    <a href="${qb.connected ? "/report?type=commissions" : "/try-free"}" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
       <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Commission check</h3>
       <p style="font-size: 0.85rem; margin: 0;">Flag jobs where commission was paid below your margin floor.</p>
     </a>
-    <a href="/try-free" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
+    <a href="${qb.connected ? "/report?type=cashflow" : "/try-free"}" class="card" style="text-decoration: none; color: var(--text); transition: border-color 0.15s;">
       <h3 style="margin: 0 0 0.5rem; font-size: 1rem;">Cash flow forecast</h3>
       <p style="font-size: 0.85rem; margin: 0;">See where your cash is headed over the next 90 days.</p>
     </a>
   </div>
 
-  <a href="/try-free" class="btn" style="margin-top: 0.5rem;">Upload a spreadsheet &rarr;</a>
+  <a href="/try-free" class="btn btn-ghost" style="margin-top: 0.5rem;">Upload a spreadsheet instead</a>
 
 </div></body></html>`;
 }
 
 function renderSuccessPage(apiKey: string, paid: boolean): string {
   const safeKey = escapeHtml(apiKey);
-  const head = paid ? `Welcome to <span>BuildAudit Pro</span>.` : `Your account is set up.`;
+  const head = paid ? `You're in.` : `Your account is set up.`;
   const sub = paid
-    ? "You're all set. Your account is active and ready to use. Save your account key below — you'll need it to log in."
+    ? "Your BuildAudit Pro subscription is active. Connect your QuickBooks below to start seeing which jobs make money and which don't."
     : "Your subscription isn't active yet, but your account is reserved. Check your email for a payment confirmation.";
+
+  const qbConnectUrl = `/qb/connect?api_key=${encodeURIComponent(apiKey)}`;
 
   return /* html */ `<!doctype html><html lang="en"><head>
   <title>BuildAudit — Welcome</title>${PAGE_HEAD}
@@ -1274,15 +1403,18 @@ function renderSuccessPage(apiKey: string, paid: boolean): string {
   <h1>${head}</h1>
   <p class="lead">${sub}</p>
 
-  <h2>Your account key</h2>
-  <div class="key-box">
-    <code id="apiKey">${safeKey}</code>
-    <button class="copy-btn" id="copyBtn" onclick="copyKey()">Copy</button>
-  </div>
-  <p style="font-size:0.85rem;">Save this somewhere safe — you'll need it to access your account. Treat it like a password.</p>
+  ${paid ? `
+  <a href="${qbConnectUrl}" class="btn" style="margin: 1.5rem 0; font-size: 1.1rem; padding: 1rem 1.5rem;">Connect QuickBooks &rarr;</a>
+  <p style="font-size: 0.9rem; color: var(--muted);">Don't use QuickBooks? <a href="/try-free" style="color: var(--accent-2);">Upload a spreadsheet instead</a></p>
+  ` : ""}
 
-  <h2>What's next</h2>
-  <p>Head to your <a href="/" style="color: var(--accent-2);">BuildAudit dashboard</a> and paste this key to log in. From there you can connect QuickBooks or upload your first file.</p>
+  <div style="margin-top: 2.5rem; padding-top: 1.5rem; border-top: 1px solid var(--border);">
+    <p style="font-size: 0.85rem; color: var(--muted);">Your account key (save it — you'll need it if you log in from another device):</p>
+    <div class="key-box">
+      <code id="apiKey">${safeKey}</code>
+      <button class="copy-btn" id="copyBtn" onclick="copyKey()">Copy</button>
+    </div>
+  </div>
 
   <script>
     function copyKey() {
@@ -1336,15 +1468,9 @@ function renderQbConnectedPage(realmId: string): string {
   <h2>Company ID</h2>
   <pre>${safe}</pre>
 
-  <h2>Try it</h2>
-  <p>Open Claude Desktop or Cursor and ask:</p>
-  <pre>"Pull my jobs from QuickBooks and tell me which ones are losing money."</pre>
-  <p>The assistant will call <code>quickbooks_sync</code> → <code>analyze_jobs</code> and surface the underwater jobs with dollar exposure.</p>
+  <p style="font-size: 0.9rem; color: var(--muted); margin-top: 1.5rem;">Your data syncs automatically. Access tokens refresh in the background — no action needed unless you don't log in for 100+ days.</p>
 
-  <h2>Token lifecycle</h2>
-  <p style="font-size: 0.9rem;">Access tokens auto-refresh in the background using your refresh token (good for ~100 days of inactivity). If you don't sync for over 100 days you'll be prompted to reconnect.</p>
-
-  <p style="margin-top: 2rem;"><a href="/upgrade" class="btn btn-ghost">Back to plans</a></p>
+  <a href="/" class="btn" style="margin-top: 1.5rem;">Go to your dashboard &rarr;</a>
 </div></body></html>`;
 }
 
